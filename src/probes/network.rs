@@ -1,10 +1,39 @@
 use serde_json::Value;
 
 use super::{glob, json, same_address};
+use crate::config::{Neighbour, OneOrMany, Tied};
 use crate::exec::Runner;
 use crate::outcome::Outcome;
 
-pub fn proxy_neigh(runner: &dyn Runner, dev: &str, expect: &[String]) -> Outcome {
+/// Does machined know the machine? `None`: machinectl itself does not answer.
+fn runs(runner: &dyn Runner, machine: &str) -> Option<bool> {
+    if runner
+        .run(&["machinectl", "show", machine, "-p", "State"])
+        .is_ok()
+    {
+        return Some(true);
+    }
+    runner
+        .run(&["machinectl", "list", "--no-legend"])
+        .ok()
+        .map(|_| false)
+}
+
+pub fn proxy_neigh(runner: &dyn Runner, dev: &str, expect: &[Neighbour]) -> Outcome {
+    // Whose machine does not run is not expected — and if it is there all
+    // the same, it is the leftover this probe is after.
+    let mut wanted: Vec<String> = Vec::new();
+    for neighbour in expect {
+        match neighbour {
+            Neighbour::Always(address) => wanted.push(address.clone()),
+            Neighbour::WhileRunning(Tied { address, machine }) => match runs(runner, machine) {
+                Some(true) => wanted.push(address.clone()),
+                Some(false) => {}
+                None => return Outcome::failed("machinectl does not answer"),
+            },
+        }
+    }
+    let expect = &wanted;
     let doc = match json(
         runner,
         &["ip", "-j", "-6", "neigh", "show", "proxy", "dev", dev],
@@ -111,7 +140,8 @@ pub fn machine_addr(
     )
 }
 
-pub fn bridge_isolated(runner: &dyn Runner, ports: &str) -> Outcome {
+pub fn bridge_isolated(runner: &dyn Runner, ports: &OneOrMany) -> Outcome {
+    let ports = ports.as_slice();
     let doc = match json(runner, &["bridge", "-j", "-d", "link"]) {
         Ok(doc) => doc,
         Err(outcome) => return outcome,
@@ -120,10 +150,15 @@ pub fn bridge_isolated(runner: &dyn Runner, ports: &str) -> Outcome {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|l| l["ifname"].as_str().is_some_and(|n| glob(ports, n)))
+        .filter(|l| {
+            l["ifname"]
+                .as_str()
+                .is_some_and(|n| ports.iter().any(|p| glob(p, n)))
+        })
         .collect();
     if matching.is_empty() {
-        // A pattern that meets nothing measures nothing.
+        // Patterns that meet nothing at all measure nothing. A single name
+        // that is missing is a guest that does not run, and no finding.
         return Outcome::failed(format!("no bridge port matches {ports:?}"));
     }
     let open: Vec<&str> = matching
@@ -165,11 +200,11 @@ mod tests {
     fn proxies_as_expected_missing_and_left_over() {
         let cmd = "ip -j -6 neigh show proxy dev br-exp";
         let r = FakeRunner::default().command(cmd, NEIGH);
-        let all = all_proxies();
+        let all: Vec<Neighbour> = all_proxies().into_iter().map(Neighbour::Always).collect();
         assert_eq!(proxy_neigh(&r, "br-exp", &all).ok, Some(true));
 
         let mut more = all.clone();
-        more.push("fd00:dead::1".into());
+        more.push(Neighbour::Always("fd00:dead::1".into()));
         let o = proxy_neigh(&r, "br-exp", &more);
         assert_eq!((o.ok, o.values[0].1), (Some(false), 1.0));
 
@@ -177,6 +212,44 @@ mod tests {
         assert_eq!((o.ok, o.values[1].1), (Some(false), 1.0));
 
         assert!(!proxy_neigh(&FakeRunner::default(), "br-gone", &all).success);
+    }
+
+    #[test]
+    fn a_proxy_that_outlived_its_guest_is_the_finding() {
+        let cmd = "ip -j -6 neigh show proxy dev br-exp";
+        let addresses = all_proxies();
+        let tied: Vec<Neighbour> = addresses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                Neighbour::WhileRunning(Tied {
+                    address: a.clone(),
+                    machine: format!("guest-{i}"),
+                })
+            })
+            .collect();
+        let machines = |stopped: Option<usize>| {
+            let mut r = FakeRunner::default()
+                .command(cmd, NEIGH)
+                .command("machinectl list --no-legend", "");
+            for i in 0..addresses.len() {
+                if Some(i) != stopped {
+                    r = r.command(
+                        &format!("machinectl show guest-{i} -p State"),
+                        "State=running",
+                    );
+                }
+            }
+            r
+        };
+        assert_eq!(proxy_neigh(&machines(None), "br-exp", &tied).ok, Some(true));
+        // guest-0 is stopped, its proxy neighbour is still there.
+        let o = proxy_neigh(&machines(Some(0)), "br-exp", &tied);
+        assert_eq!(o.ok, Some(false));
+        assert_eq!(o.values[1], ("unexpected".to_string(), 1.0));
+        // A machinectl that answers nothing must not read as "all stopped".
+        let mute = FakeRunner::default().command(cmd, NEIGH);
+        assert!(!proxy_neigh(&mute, "br-exp", &tied).success);
     }
 
     fn guest_address() -> String {
@@ -245,17 +318,22 @@ mod tests {
     #[test]
     fn isolated_ports_an_open_one_and_a_pattern_that_meets_nothing() {
         let r = FakeRunner::default().command("bridge -j -d link", LINK);
-        let o = bridge_isolated(&r, "vb-*");
+        let one = |p: &str| OneOrMany::One(p.to_string());
+        let o = bridge_isolated(&r, &one("vb-*"));
         assert_eq!((o.ok, o.values[0].1), (Some(true), 5.0));
+        // Exact names; the guest that does not run is simply not there.
+        let named = OneOrMany::Many(vec!["vb-torrent-01".into(), "vb-stopped-01".into()]);
+        let o = bridge_isolated(&r, &named);
+        assert_eq!((o.ok, o.values[0].1), (Some(true), 1.0));
 
         let mut doc: Value = serde_json::from_str(LINK).unwrap();
         doc[1]["isolated"] = Value::Bool(false);
         let r = FakeRunner::default().command("bridge -j -d link", &doc.to_string());
-        let o = bridge_isolated(&r, "vb-*");
+        let o = bridge_isolated(&r, &one("vb-*"));
         assert_eq!(o.ok, Some(false));
         assert!(o.note.unwrap().contains("vb-torrent-01"));
 
         let r = FakeRunner::default().command("bridge -j -d link", LINK);
-        assert!(!bridge_isolated(&r, "veth*").success);
+        assert!(!bridge_isolated(&r, &one("veth*")).success);
     }
 }

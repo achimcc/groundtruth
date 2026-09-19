@@ -44,7 +44,7 @@ pub enum Probe {
     /// A sysctl has the expected value.
     Sysctl { key: String, expect: String },
     /// The proxy neighbours of a device are exactly the expected ones.
-    ProxyNeigh { dev: String, expect: Vec<String> },
+    ProxyNeigh { dev: String, expect: Vec<Neighbour> },
     /// A running systemd machine holds its addresses, none of them failed
     /// or still tentative.
     MachineAddr {
@@ -52,9 +52,43 @@ pub enum Probe {
         ifname: String,
         expect: Vec<String>,
     },
-    /// Every bridge port matching the pattern is isolated. `*` is the only
-    /// wildcard.
-    BridgeIsolated { ports: String },
+    /// Every bridge port matching one of the patterns is isolated. `*` is
+    /// the only wildcard.
+    BridgeIsolated { ports: OneOrMany },
+}
+
+/// An address that must be a proxy neighbour — always, or for as long as a
+/// systemd machine runs. Tied to a machine, it must be GONE while that
+/// machine does not run: a proxy neighbour that outlives its guest answers
+/// the guest's duplicate address detection when it comes back.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Neighbour {
+    Always(String),
+    WhileRunning(Tied),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tied {
+    pub address: String,
+    pub machine: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            OneOrMany::One(one) => std::slice::from_ref(one),
+            OneOrMany::Many(many) => many,
+        }
+    }
 }
 
 impl Probe {

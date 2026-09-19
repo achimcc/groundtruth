@@ -93,9 +93,9 @@ unknown probe and a name used twice are errors.
 | `nft_counter` | `family`, `table`, `counters` | none: packets per counter as `value`; empty list means all |
 | `iptables_dnat_duplicates` | | no two DNAT rules for the same protocol, destination and port, and no two jumps for the same port in a `…HOSTPORT-DNAT` chain |
 | `sysctl` | `key`, `expect` | the value is the expected one; a key that cannot be read cannot be measured |
-| `proxy_neigh` | `dev`, `expect` | the IPv6 proxy neighbours of the device are exactly these |
+| `proxy_neigh` | `dev`, `expect` | the IPv6 proxy neighbours of the device are exactly these; an entry `{ address, machine }` is expected only while that machine runs, and is a finding while it does not |
 | `machine_addr` | `machine`, `ifname`, `expect` | the running systemd machine holds these addresses, none `dadfailed` or `tentative` |
-| `bridge_isolated` | `ports` | every bridge port matching the pattern (`*` is the wildcard) is `isolated` |
+| `bridge_isolated` | `ports` | every bridge port matching the pattern, or one of a list (`*` is the wildcard), is `isolated` |
 
 Notes:
 
@@ -103,8 +103,9 @@ Notes:
   {item="running"} 0`. Whether it should run is somebody else's question.
   The leader PID comes from `machinectl show`, the addresses from
   `nsenter -n ip -j addr`.
-- **`bridge_isolated` and a pattern that matches nothing:** cannot measure. A
-  pattern that meets no port measures nothing, and says so.
+- **`bridge_isolated` and patterns that match nothing at all:** cannot
+  measure, and says so. One name of a list that is missing is a guest that
+  does not run.
 - **`sysctl` keys with a dot in the interface name** (`eth0.20`): write the key
   with slashes, `net/ipv6/conf/eth0.20/use_tempaddr`.
 - Addresses compare by value: `fd00::0:1` is `fd00::1`.
@@ -125,7 +126,7 @@ command gets ten seconds.
 ## Install
 
 ```nix
-inputs.groundtruth.url = "github:achimcc/groundtruth/v0.1.0";
+inputs.groundtruth.url = "github:achimcc/groundtruth/v0.1.1";
 
 systemd.services.groundtruth = {
   serviceConfig = {

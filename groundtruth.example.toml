@@ -38,7 +38,10 @@ expect = "0"
 name = "proxy-neigh-exp"
 probe = "proxy_neigh"
 dev = "br-exp"
-expect = ["fd00:0:0:20::11", "fd00:0:0:20::12"]
+expect = [
+  { address = "fd00:0:0:20::11", machine = "torrent-01" }, # while it runs, and GONE otherwise
+  "fd00:0:0:20::12",                                       # always
+]
 
 # ... and this is where that shows: the guest gave its address up.
 [[check]]
@@ -51,4 +54,4 @@ expect = ["fd00:0:0:20::11"]
 [[check]]
 name = "guest-ports-isolated"
 probe = "bridge_isolated"
-ports = "vb-*"
+ports = ["vb-torrent-01", "vb-slsk-01"] # or one pattern: "vb-*"
