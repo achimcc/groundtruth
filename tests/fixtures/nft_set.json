@@ -1,0 +1,1 @@
+{"nftables": [{"metainfo": {"version": "1.1.6", "release_name": "Commodore Bullmoose #7", "json_schema_version": 1}}, {"set": {"family": "inet", "name": "lanPraefixe", "table": "lan6", "type": "ipv6_addr", "handle": 3, "flags": ["interval"], "auto-merge": true, "elem": [{"prefix": {"addr": "2001:db8:1::", "len": 56}}, {"prefix": {"addr": "fdd6:2793:7bdb::", "len": 64}}]}}]}

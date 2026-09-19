@@ -1,0 +1,1 @@
+[{"dst":"fd00:20::11","dev":"br-int","proxy":null},{"dst":"fd00:10::11","dev":"br-exp","proxy":null},{"dst":"fd00:10::10","dev":"br-exp","proxy":null},{"dst":"fd00:20::10","dev":"br-int","proxy":null},{"dst":"fd00:20::12","dev":"br-int","proxy":null},{"dst":"fd00:10::12","dev":"br-exp","proxy":null}]

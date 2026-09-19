@@ -1,0 +1,23 @@
+[package]
+name = "groundtruth"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Measures the state a unit's status only promises: nftables sets, DNAT leftovers, proxy neighbours, addresses, sysctls"
+repository = "https://github.com/achimcc/groundtruth"
+readme = "README.md"
+keywords = ["prometheus", "nftables", "systemd", "monitoring", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+lexopt = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true

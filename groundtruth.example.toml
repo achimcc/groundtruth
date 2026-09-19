@@ -1,0 +1,54 @@
+# groundtruth.toml: what to look at, and what to expect there.
+# An unknown key, an unknown probe and a name used twice are errors.
+
+# The barrier between guests and the home network is a rule over this set.
+# A unit refills it; the unit was "active (exited)" while the set was empty.
+[[check]]
+name = "lan6-prefixes"
+probe = "nft_set"
+family = "inet"
+table = "lan6"
+set = "lanPraefixe"
+min = 1
+
+# Raw values, no verdict: rates and alerts are Prometheus' business.
+[[check]]
+name = "zone-counters"
+probe = "nft_counter"
+family = "inet"
+table = "zonenkanten"
+counters = []          # empty: every counter of the table
+
+# podman leaves a rule behind when a teardown fails, and iptables takes the
+# first of two. Units active, containers healthy, the port a 502.
+[[check]]
+name = "dnat-leftovers"
+probe = "iptables_dnat_duplicates"
+
+# A setting that named an interface goes away with the interface's name.
+[[check]]
+name = "tempaddr-off"
+probe = "sysctl"
+key = "net.ipv6.conf.enp8s0.use_tempaddr"
+expect = "0"
+
+# Exactly these, no more: a proxy neighbour that outlives its guest answers
+# the guest's duplicate address detection when it comes back.
+[[check]]
+name = "proxy-neigh-exp"
+probe = "proxy_neigh"
+dev = "br-exp"
+expect = ["fd00:0:0:20::11", "fd00:0:0:20::12"]
+
+# ... and this is where that shows: the guest gave its address up.
+[[check]]
+name = "addr-torrent-01"
+probe = "machine_addr"
+machine = "torrent-01"
+ifname = "host0"
+expect = ["fd00:0:0:20::11"]
+
+[[check]]
+name = "guest-ports-isolated"
+probe = "bridge_isolated"
+ports = "vb-*"
