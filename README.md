@@ -95,6 +95,7 @@ unknown probe and a name used twice are errors.
 | `sysctl` | `key`, `expect` | the value is the expected one; a key that cannot be read cannot be measured |
 | `proxy_neigh` | `dev`, `expect` | the IPv6 proxy neighbours of the device are exactly these; an entry `{ address, machine }` is expected only while that machine runs, and is a finding while it does not |
 | `machine_addr` | `machine`, `ifname`, `expect` | the running systemd machine holds these addresses, none `dadfailed` or `tentative` |
+| `machine_caps` | `machine`, `expect` | the capability bounding set of the running machine's leader is exactly this hexadecimal mask; `extra` and `missing` count the bits that differ |
 | `bridge_isolated` | `ports` | every bridge port matching the pattern, or one of a list (`*` is the wildcard), is `isolated` |
 
 Notes:
@@ -103,6 +104,10 @@ Notes:
   {item="running"} 0`. Whether it should run is somebody else's question.
   The leader PID comes from `machinectl show`, the addresses from
   `nsenter -n ip -j addr`.
+- **`machine_caps`** reads `CapBnd` from `/proc/<leader>/status`. A bit too
+  many is a guest started before a cut, or by a unit that lost it; a bit
+  too few means the declaration is wrong. A machine that does not run: no
+  verdict, as with `machine_addr`.
 - **`bridge_isolated` and patterns that match nothing at all:** cannot
   measure, and says so. One name of a list that is missing is a guest that
   does not run.
@@ -126,7 +131,7 @@ command gets ten seconds.
 ## Install
 
 ```nix
-inputs.groundtruth.url = "github:achimcc/groundtruth/v0.1.1";
+inputs.groundtruth.url = "github:achimcc/groundtruth/v0.2.0";
 
 systemd.services.groundtruth = {
   serviceConfig = {

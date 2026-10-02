@@ -73,18 +73,16 @@ fn property<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|l| l.strip_prefix(name)?.strip_prefix('='))
 }
 
-pub fn machine_addr(
-    runner: &dyn Runner,
-    machine: &str,
-    ifname: &str,
-    expect: &[String],
-) -> Outcome {
+/// The leader PID of a running machine — or the outcome that ends the probe:
+/// no verdict for a machine that does not run, a failure when machined
+/// cannot be asked.
+fn leader_of(runner: &dyn Runner, machine: &str) -> Result<String, Outcome> {
     let shown = runner.run(&["machinectl", "show", machine, "-p", "Leader", "-p", "State"]);
     let Ok(shown) = shown else {
         // Unknown to machined: it does not run. Whether it SHOULD is not
         // this probe's business. But a machinectl that answers nothing at
         // all would make every machine look stopped, so ask it once more.
-        return match runner.run(&["machinectl", "list", "--no-legend"]) {
+        return Err(match runner.run(&["machinectl", "list", "--no-legend"]) {
             Ok(_) => Outcome {
                 success: true,
                 ok: None,
@@ -92,13 +90,71 @@ pub fn machine_addr(
                 note: Some(format!("{machine} is not running")),
             },
             Err(e) => Outcome::failed(format!("{e:#}")),
-        };
+        });
     };
-    let Some(leader) = property(&shown, "Leader").filter(|l| *l != "0") else {
-        return Outcome::failed(format!("machinectl names no leader for {machine}"));
+    match property(&shown, "Leader").filter(|l| *l != "0") {
+        Some(leader) => Ok(leader.to_string()),
+        None => Err(Outcome::failed(format!(
+            "machinectl names no leader for {machine}"
+        ))),
+    }
+}
+
+/// The capability bounding set of a running machine's leader is exactly the
+/// expected mask. A bit too many is the finding this probe exists for: a
+/// guest that was started before the cut, or by a unit that lost it. A bit
+/// too few is reported as well — the declaration is then wrong, and a
+/// service inside may be failing for it.
+pub fn machine_caps(runner: &dyn Runner, machine: &str, expect: &str) -> Outcome {
+    let Some(wanted) = mask(expect) else {
+        return Outcome::failed(format!("expect {expect:?} is not a hexadecimal mask"));
+    };
+    let leader = match leader_of(runner, machine) {
+        Ok(leader) => leader,
+        Err(outcome) => return outcome,
+    };
+    let status = match runner.read(&format!("/proc/{leader}/status")) {
+        Ok(text) => text,
+        Err(e) => return Outcome::failed(format!("{e:#}")),
+    };
+    let found = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapBnd:"))
+        .and_then(mask);
+    let Some(found) = found else {
+        return Outcome::failed(format!("/proc/{leader}/status names no CapBnd"));
+    };
+    let extra = found & !wanted;
+    let missing = wanted & !found;
+    let ok = extra == 0 && missing == 0;
+    Outcome::judged(
+        ok,
+        vec![
+            ("extra".into(), f64::from(extra.count_ones())),
+            ("missing".into(), f64::from(missing.count_ones())),
+        ],
+        (!ok).then(|| {
+            format!("{machine}: CapBnd {found:016x}, expected {wanted:016x} (extra {extra:x}, missing {missing:x})")
+        }),
+    )
+}
+
+fn mask(text: &str) -> Option<u64> {
+    u64::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+}
+
+pub fn machine_addr(
+    runner: &dyn Runner,
+    machine: &str,
+    ifname: &str,
+    expect: &[String],
+) -> Outcome {
+    let leader = match leader_of(runner, machine) {
+        Ok(leader) => leader,
+        Err(outcome) => return outcome,
     };
     let argv = [
-        "nsenter", "-t", leader, "-n", "ip", "-j", "addr", "show", "dev", ifname,
+        "nsenter", "-t", &leader, "-n", "ip", "-j", "addr", "show", "dev", ifname,
     ];
     let doc = match json(runner, &argv) {
         Ok(doc) => doc,
@@ -269,6 +325,64 @@ mod tests {
         FakeRunner::default()
             .command(SHOW, "Leader=4242\nState=running\n")
             .command(ENTER, addr_json)
+    }
+
+    const STATUS: &str = "Name:\tsystemd\nCapInh:\t0000000000000000\nCapPrm:\t00000000a1ec15ff\nCapBnd:\t00000000a1ec15ff\nNoNewPrivs:\t0\n";
+
+    fn caps(status: &str) -> FakeRunner {
+        FakeRunner::default()
+            .command(SHOW, "Leader=4242\nState=running\n")
+            .file("/proc/4242/status", status)
+    }
+
+    #[test]
+    fn a_guest_with_the_declared_bounding_set() {
+        let o = machine_caps(&caps(STATUS), "infra-01", "a1ec15ff");
+        assert_eq!((o.success, o.ok), (true, Some(true)));
+        assert!(o.values.contains(&("extra".to_string(), 0.0)));
+        // Spelled the way /proc spells it, or with a prefix: the same mask.
+        assert_eq!(
+            machine_caps(&caps(STATUS), "infra-01", "0x00000000a1ec15ff").ok,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_guest_that_holds_a_capability_too_many() {
+        // CAP_NET_RAW (bit 13) is back.
+        let status = STATUS.replace("CapBnd:\t00000000a1ec15ff", "CapBnd:\t00000000a1ec35ff");
+        let o = machine_caps(&caps(&status), "infra-01", "a1ec15ff");
+        assert_eq!(o.ok, Some(false));
+        assert!(o.values.contains(&("extra".to_string(), 1.0)));
+        assert!(o.values.contains(&("missing".to_string(), 0.0)));
+        assert!(o.note.unwrap().contains("extra 2000"));
+    }
+
+    #[test]
+    fn a_guest_that_lacks_a_declared_capability() {
+        // CAP_SYS_PTRACE (bit 19) is gone: systemd inside cannot set up
+        // PrivateUsers any more.
+        let status = STATUS.replace("CapBnd:\t00000000a1ec15ff", "CapBnd:\t00000000a1e415ff");
+        let o = machine_caps(&caps(&status), "infra-01", "a1ec15ff");
+        assert_eq!(o.ok, Some(false));
+        assert!(o.values.contains(&("missing".to_string(), 1.0)));
+    }
+
+    #[test]
+    fn capabilities_that_cannot_be_read_are_not_a_quiet_day() {
+        // No status file: the leader died between the two questions.
+        let gone = FakeRunner::default().command(SHOW, "Leader=4242\nState=running\n");
+        assert!(!machine_caps(&gone, "infra-01", "a1ec15ff").success);
+        // A status without the line, and a mask nobody can read.
+        assert!(!machine_caps(&caps("Name:\tsystemd\n"), "infra-01", "a1ec15ff").success);
+        assert!(!machine_caps(&caps(STATUS), "infra-01", "all of them").success);
+    }
+
+    #[test]
+    fn a_stopped_guest_has_no_capabilities_to_judge() {
+        let stopped = FakeRunner::default().command("machinectl list --no-legend", "");
+        let o = machine_caps(&stopped, "infra-01", "a1ec15ff");
+        assert_eq!((o.success, o.ok), (true, None));
     }
 
     #[test]

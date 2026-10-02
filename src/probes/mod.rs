@@ -34,6 +34,7 @@ pub fn run_check(check: &Check, runner: &dyn Runner) -> Outcome {
             ifname,
             expect,
         } => network::machine_addr(runner, machine, ifname, expect),
+        Probe::MachineCaps { machine, expect } => network::machine_caps(runner, machine, expect),
         Probe::BridgeIsolated { ports } => network::bridge_isolated(runner, ports),
     }
 }

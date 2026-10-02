@@ -52,6 +52,12 @@ ifname = "host0"
 expect = ["fd00:0:0:20::11"]
 
 [[check]]
+name = "caps-torrent-01"
+probe = "machine_caps"
+machine = "torrent-01"
+expect = "a1ec15ff"
+
+[[check]]
 name = "guest-ports-isolated"
 probe = "bridge_isolated"
 ports = ["vb-torrent-01", "vb-slsk-01"] # or one pattern: "vb-*"

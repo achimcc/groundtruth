@@ -52,6 +52,9 @@ pub enum Probe {
         ifname: String,
         expect: Vec<String>,
     },
+    /// The capability bounding set of a running systemd machine's leader
+    /// is exactly this hexadecimal mask.
+    MachineCaps { machine: String, expect: String },
     /// Every bridge port matching one of the patterns is isolated. `*` is
     /// the only wildcard.
     BridgeIsolated { ports: OneOrMany },
@@ -100,6 +103,7 @@ impl Probe {
             Probe::Sysctl { .. } => "sysctl",
             Probe::ProxyNeigh { .. } => "proxy_neigh",
             Probe::MachineAddr { .. } => "machine_addr",
+            Probe::MachineCaps { .. } => "machine_caps",
             Probe::BridgeIsolated { .. } => "bridge_isolated",
         }
     }
@@ -139,9 +143,9 @@ mod tests {
     #[test]
     fn the_example_loads() {
         let cfg = Config::parse(include_str!("../groundtruth.example.toml")).unwrap();
-        assert!(cfg.checks.len() >= 7);
+        assert!(cfg.checks.len() >= 8);
         let kinds: BTreeSet<&str> = cfg.checks.iter().map(|c| c.probe.kind()).collect();
-        assert_eq!(kinds.len(), 7, "the example shows every probe: {kinds:?}");
+        assert_eq!(kinds.len(), 8, "the example shows every probe: {kinds:?}");
     }
 
     #[test]
