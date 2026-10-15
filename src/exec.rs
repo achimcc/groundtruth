@@ -11,6 +11,8 @@ pub trait Runner {
     /// The standard output of a command that succeeded.
     fn run(&self, argv: &[&str]) -> Result<String>;
     fn read(&self, path: &str) -> Result<String>;
+    /// The names of the directories directly below `path` (no `.`/`..`).
+    fn subdirs(&self, path: &str) -> Result<Vec<String>>;
 }
 
 pub struct RealRunner {
@@ -64,6 +66,20 @@ impl Runner for RealRunner {
     fn read(&self, path: &str) -> Result<String> {
         std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))
     }
+
+    fn subdirs(&self, path: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(path).with_context(|| format!("cannot list {path}"))? {
+            let entry = entry.with_context(|| format!("cannot list {path}"))?;
+            // file_type does not follow symlinks: a cgroup tree has none, and
+            // a link must not lead the walk elsewhere.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                out.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
 }
 
 /// Answers from a table, for tests. A command or file that is not in the
@@ -102,5 +118,20 @@ impl Runner for FakeRunner {
             .find(|(k, _)| k == path)
             .map(|(_, v)| v.clone())
             .with_context(|| format!("cannot read {path}"))
+    }
+
+    /// Directories are implied by the file table: `a/b/c` makes `b` a
+    /// subdirectory of `a`.
+    fn subdirs(&self, path: &str) -> Result<Vec<String>> {
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let mut out: Vec<String> = self
+            .files
+            .iter()
+            .filter_map(|(k, _)| k.strip_prefix(&prefix))
+            .filter_map(|rest| rest.split_once('/').map(|(dir, _)| dir.to_string()))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 }

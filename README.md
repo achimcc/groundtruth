@@ -95,7 +95,7 @@ unknown probe and a name used twice are errors.
 | `sysctl` | `key`, `expect` | the value is the expected one; a key that cannot be read cannot be measured |
 | `proxy_neigh` | `dev`, `expect` | the IPv6 proxy neighbours of the device are exactly these; an entry `{ address, machine }` is expected only while that machine runs, and is a finding while it does not |
 | `machine_addr` | `machine`, `ifname`, `expect` | the running systemd machine holds these addresses, none `dadfailed` or `tentative` |
-| `machine_caps` | `machine`, `expect` | the capability bounding set of the running machine's leader is exactly this hexadecimal mask; `extra` and `missing` count the bits that differ |
+| `machine_caps` | `machine`, `expect` | the capability bounding set of the running machine is exactly this hexadecimal mask — `extra` over every process of its payload cgroup, `missing` at the leader; both count the bits that differ |
 | `bridge_isolated` | `ports` | every bridge port matching the pattern, or one of a list (`*` is the wildcard), is `isolated` |
 
 Notes:
@@ -104,9 +104,13 @@ Notes:
   {item="running"} 0`. Whether it should run is somebody else's question.
   The leader PID comes from `machinectl show`, the addresses from
   `nsenter -n ip -j addr`.
-- **`machine_caps`** reads `CapBnd` from `/proc/<leader>/status`. A bit too
-  many is a guest started before a cut, or by a unit that lost it; a bit
-  too few means the declaration is wrong. A machine that does not run: no
+- **`machine_caps`** reads `CapBnd` from `/proc/<pid>/status` of every
+  process in the machine's payload cgroup (from the leader's cgroup up to
+  `payload`, then the whole subtree — since 0.2.2; before, the leader
+  alone). A bit too many in any of them is a guest started before a cut, or
+  by a unit that lost it — a process older than the cut keeps its bits. A
+  bit too few is judged at the leader only (services drop bits of their own
+  on purpose) and means the declaration is wrong. A machine that does not run: no
   verdict, as with `machine_addr`.
 - **`bridge_isolated` and patterns that match nothing at all:** cannot
   measure, and says so. One name of a list that is missing is a guest that

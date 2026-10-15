@@ -100,11 +100,19 @@ fn leader_of(runner: &dyn Runner, machine: &str) -> Result<String, Outcome> {
     }
 }
 
-/// The capability bounding set of a running machine's leader is exactly the
-/// expected mask. A bit too many is the finding this probe exists for: a
-/// guest that was started before the cut, or by a unit that lost it. A bit
-/// too few is reported as well — the declaration is then wrong, and a
-/// service inside may be failing for it.
+/// The capability bounding set of a running machine is exactly the expected
+/// mask. A bit too many is the finding this probe exists for: a guest that
+/// was started before the cut, or by a unit that lost it. A bit too few is
+/// reported as well — the declaration is then wrong, and a service inside
+/// may be failing for it.
+///
+/// EXTRA OVER EVERY PROCESS OF THE PAYLOAD, MISSING AT THE LEADER (audit 4,
+/// B218). Until 0.2.1 only the leader was read: a process started before the
+/// cut keeps its bits — the bounding set is inherited and never regained —
+/// and the verdict was `ok` while it ran. So the union of `CapBnd` over all
+/// processes in the payload cgroup is held against the mask. "Missing" stays
+/// with the leader: services inside drop bits of their own on purpose
+/// (`CapabilityBoundingSet=`), that is no finding.
 pub fn machine_caps(runner: &dyn Runner, machine: &str, expect: &str) -> Outcome {
     let Some(wanted) = mask(expect) else {
         return Outcome::failed(format!("expect {expect:?} is not a hexadecimal mask"));
@@ -113,19 +121,37 @@ pub fn machine_caps(runner: &dyn Runner, machine: &str, expect: &str) -> Outcome
         Ok(leader) => leader,
         Err(outcome) => return outcome,
     };
-    let status = match runner.read(&format!("/proc/{leader}/status")) {
-        Ok(text) => text,
-        Err(e) => return Outcome::failed(format!("{e:#}")),
+    let cap_bnd = |pid: &str| -> Result<Option<u64>, String> {
+        let status = runner
+            .read(&format!("/proc/{pid}/status"))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapBnd:"))
+            .and_then(mask))
     };
-    let found = status
-        .lines()
-        .find_map(|l| l.strip_prefix("CapBnd:"))
-        .and_then(mask);
-    let Some(found) = found else {
-        return Outcome::failed(format!("/proc/{leader}/status names no CapBnd"));
+    let leader_bnd = match cap_bnd(&leader) {
+        Ok(Some(found)) => found,
+        Ok(None) => return Outcome::failed(format!("/proc/{leader}/status names no CapBnd")),
+        Err(e) => return Outcome::failed(e),
     };
+    let pids = match payload_pids(runner, &leader) {
+        Ok(pids) => pids,
+        Err(e) => return Outcome::failed(e),
+    };
+    // A process that ended between listing and reading is not a finding.
+    let mut found = leader_bnd;
+    let mut over = 0u32;
+    for pid in &pids {
+        if let Ok(Some(bnd)) = cap_bnd(pid) {
+            found |= bnd;
+            if bnd & !wanted != 0 {
+                over += 1;
+            }
+        }
+    }
     let extra = found & !wanted;
-    let missing = wanted & !found;
+    let missing = wanted & !leader_bnd;
     let ok = extra == 0 && missing == 0;
     Outcome::judged(
         ok,
@@ -134,9 +160,51 @@ pub fn machine_caps(runner: &dyn Runner, machine: &str, expect: &str) -> Outcome
             ("missing".into(), f64::from(missing.count_ones())),
         ],
         (!ok).then(|| {
-            format!("{machine}: CapBnd {found:016x}, expected {wanted:016x} (extra {extra:x}, missing {missing:x})")
+            format!(
+                "{machine}: CapBnd {found:016x} over {} processes ({over} with extra bits), expected {wanted:016x} (extra {extra:x}, missing {missing:x})",
+                pids.len().max(1)
+            )
         }),
     )
+}
+
+/// Every pid in the machine's payload cgroup: from the leader's cgroup up to
+/// the `payload` component (systemd-nspawn puts the container's init in
+/// `…/payload/init.scope`, its services beside it), then the whole subtree.
+/// Without a `payload` component the leader's own cgroup is the root.
+fn payload_pids(runner: &dyn Runner, leader: &str) -> Result<Vec<String>, String> {
+    let cgroup = runner
+        .read(&format!("/proc/{leader}/cgroup"))
+        .map_err(|e| format!("{e:#}"))?;
+    let Some(path) = cgroup.lines().find_map(|l| l.strip_prefix("0::")) else {
+        return Err(format!("/proc/{leader}/cgroup names no cgroup v2 path"));
+    };
+    let path = path.trim();
+    let root = match path.split('/').position(|c| c == "payload") {
+        Some(i) => path.split('/').take(i + 1).collect::<Vec<_>>().join("/"),
+        None => path.to_string(),
+    };
+    let top = format!("/sys/fs/cgroup{root}");
+    let mut pids = Vec::new();
+    let mut todo = vec![top.clone()];
+    while let Some(dir) = todo.pop() {
+        // A leaf may vanish while it is walked; only the root has to be
+        // there, or the walk measured nothing.
+        match runner.read(&format!("{dir}/cgroup.procs")) {
+            Ok(text) => pids.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string),
+            ),
+            Err(e) if dir == top => return Err(format!("{e:#}")),
+            Err(_) => {}
+        }
+        if let Ok(subs) = runner.subdirs(&dir) {
+            todo.extend(subs.into_iter().map(|s| format!("{dir}/{s}")));
+        }
+    }
+    Ok(pids)
 }
 
 fn mask(text: &str) -> Option<u64> {
@@ -329,10 +397,61 @@ mod tests {
 
     const STATUS: &str = "Name:\tsystemd\nCapInh:\t0000000000000000\nCapPrm:\t00000000a1ec15ff\nCapBnd:\t00000000a1ec15ff\nNoNewPrivs:\t0\n";
 
+    const PAYLOAD: &str = "/sys/fs/cgroup/machine.slice/systemd-nspawn@infra-01.service/payload";
+
     fn caps(status: &str) -> FakeRunner {
         FakeRunner::default()
             .command(SHOW, "Leader=4242\nState=running\n")
             .file("/proc/4242/status", status)
+            .file(
+                "/proc/4242/cgroup",
+                "0::/machine.slice/systemd-nspawn@infra-01.service/payload/init.scope\n",
+            )
+            .file(&format!("{PAYLOAD}/cgroup.procs"), "")
+            .file(&format!("{PAYLOAD}/init.scope/cgroup.procs"), "4242\n")
+            .file(&format!("{PAYLOAD}/system.slice/cgroup.procs"), "")
+    }
+
+    /// The guest with one more service process beside its init.
+    fn caps_with_child(leader: &str, child: &str) -> FakeRunner {
+        caps(leader)
+            .file(
+                &format!("{PAYLOAD}/system.slice/blocky.service/cgroup.procs"),
+                "4300\n",
+            )
+            .file("/proc/4300/status", child)
+    }
+
+    /// B218: the leader was restarted with the cut, an older process still
+    /// holds CAP_NET_RAW. The leader alone says ok; the payload does not.
+    #[test]
+    fn an_older_process_with_a_capability_too_many_is_found() {
+        let child = STATUS.replace("CapBnd:\t00000000a1ec15ff", "CapBnd:\t00000000a1ec35ff");
+        let o = machine_caps(&caps_with_child(STATUS, &child), "infra-01", "a1ec15ff");
+        assert_eq!(o.ok, Some(false));
+        assert!(o.values.contains(&("extra".to_string(), 1.0)));
+        let note = o.note.unwrap();
+        assert!(note.contains("extra 2000"), "{note}");
+        assert!(note.contains("1 with extra bits"), "{note}");
+    }
+
+    /// A service that drops bits of its own is not "missing" — that is
+    /// judged at the leader only.
+    #[test]
+    fn a_service_with_a_smaller_bounding_set_is_no_finding() {
+        let child = STATUS.replace("CapBnd:\t00000000a1ec15ff", "CapBnd:\t0000000000000000");
+        let o = machine_caps(&caps_with_child(STATUS, &child), "infra-01", "a1ec15ff");
+        assert_eq!(o.ok, Some(true), "{:?}", o.note);
+    }
+
+    /// A process that ended between listing and reading is skipped.
+    #[test]
+    fn a_process_gone_during_the_walk_is_skipped() {
+        let r = caps(STATUS).file(
+            &format!("{PAYLOAD}/system.slice/gone.service/cgroup.procs"),
+            "4999\n",
+        );
+        assert_eq!(machine_caps(&r, "infra-01", "a1ec15ff").ok, Some(true));
     }
 
     #[test]
