@@ -113,6 +113,16 @@ fn leader_of(runner: &dyn Runner, machine: &str) -> Result<String, Outcome> {
 /// processes in the payload cgroup is held against the mask. "Missing" stays
 /// with the leader: services inside drop bits of their own on purpose
 /// (`CapabilityBoundingSet=`), that is no finding.
+///
+/// ONLY PROCESSES IN THE GUEST'S USER NAMESPACE COUNT (0.2.3). A process that
+/// creates a user namespace of its own — Chromium's sandbox in kar-01, a
+/// service with `PrivateUsers=` such as slskd in slsk-01 — gets a FULL
+/// bounding set from the kernel, relative to that inner namespace, and its
+/// bits mean nothing towards the guest. 0.2.2 counted them and reported 16
+/// extra capabilities for both guests on the first run after the deploy
+/// (2026-10-17). Skipped is a process whose user namespace is neither the
+/// leader's nor the host's; one in the HOST's namespace inside the payload
+/// is counted — that is exactly the process this probe must not miss.
 pub fn machine_caps(runner: &dyn Runner, machine: &str, expect: &str) -> Outcome {
     let Some(wanted) = mask(expect) else {
         return Outcome::failed(format!("expect {expect:?} is not a hexadecimal mask"));
@@ -139,10 +149,28 @@ pub fn machine_caps(runner: &dyn Runner, machine: &str, expect: &str) -> Outcome
         Ok(pids) => pids,
         Err(e) => return Outcome::failed(e),
     };
+    let userns = |pid: &str| runner.readlink(&format!("/proc/{pid}/ns/user"));
+    let leader_ns = match userns(&leader) {
+        Ok(ns) => ns,
+        Err(e) => return Outcome::failed(format!("{e:#}")),
+    };
+    let host_ns = match userns("1") {
+        Ok(ns) => ns,
+        Err(e) => return Outcome::failed(format!("{e:#}")),
+    };
     // A process that ended between listing and reading is not a finding.
     let mut found = leader_bnd;
     let mut over = 0u32;
+    let mut nested = 0u32;
     for pid in &pids {
+        match userns(pid) {
+            Ok(ns) if ns != leader_ns && ns != host_ns => {
+                nested += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => continue,
+        }
         if let Ok(Some(bnd)) = cap_bnd(pid) {
             found |= bnd;
             if bnd & !wanted != 0 {
@@ -161,7 +189,7 @@ pub fn machine_caps(runner: &dyn Runner, machine: &str, expect: &str) -> Outcome
         ],
         (!ok).then(|| {
             format!(
-                "{machine}: CapBnd {found:016x} over {} processes ({over} with extra bits), expected {wanted:016x} (extra {extra:x}, missing {missing:x})",
+                "{machine}: CapBnd {found:016x} over {} processes ({over} with extra bits, {nested} in a nested user namespace skipped), expected {wanted:016x} (extra {extra:x}, missing {missing:x})",
                 pids.len().max(1)
             )
         }),
@@ -410,6 +438,8 @@ mod tests {
             .file(&format!("{PAYLOAD}/cgroup.procs"), "")
             .file(&format!("{PAYLOAD}/init.scope/cgroup.procs"), "4242\n")
             .file(&format!("{PAYLOAD}/system.slice/cgroup.procs"), "")
+            .link("/proc/1/ns/user", "user:[4026531837]")
+            .link("/proc/4242/ns/user", "user:[4026533663]")
     }
 
     /// The guest with one more service process beside its init.
@@ -420,6 +450,42 @@ mod tests {
                 "4300\n",
             )
             .file("/proc/4300/status", child)
+            .link("/proc/4300/ns/user", "user:[4026533663]")
+    }
+
+    /// The same, with the child in a user namespace of the given name.
+    fn caps_with_child_in(leader: &str, child: &str, ns: &str) -> FakeRunner {
+        let mut r = caps_with_child(leader, child);
+        r.links.retain(|(k, _)| k != "/proc/4300/ns/user");
+        r.link("/proc/4300/ns/user", ns)
+    }
+
+    const FULL_IN_NESTED_NS: &str = "Name:\tchromium\nCapBnd:\t000001f3f5fcffff\n";
+
+    /// kar-01 on 2026-10-17: Chromium's sandbox has a full bounding set in
+    /// its own user namespace. That says nothing about the guest.
+    #[test]
+    fn a_process_in_a_nested_user_namespace_is_skipped() {
+        let r = caps_with_child_in(STATUS, FULL_IN_NESTED_NS, "user:[4026536301]");
+        let o = machine_caps(&r, "infra-01", "a1ec15ff");
+        assert_eq!(o.ok, Some(true), "{:?}", o.note);
+    }
+
+    /// A process of the HOST's user namespace inside the payload counts.
+    #[test]
+    fn a_host_process_inside_the_payload_is_found() {
+        let r = caps_with_child_in(STATUS, FULL_IN_NESTED_NS, "user:[4026531837]");
+        let o = machine_caps(&r, "infra-01", "a1ec15ff");
+        assert_eq!(o.ok, Some(false));
+        assert!(o.note.unwrap().contains("1 with extra bits"));
+    }
+
+    /// Without the leader's namespace there is nothing to compare against.
+    #[test]
+    fn an_unreadable_leader_namespace_is_no_verdict() {
+        let mut r = caps(STATUS);
+        r.links.retain(|(k, _)| k != "/proc/4242/ns/user");
+        assert!(!machine_caps(&r, "infra-01", "a1ec15ff").success);
     }
 
     /// B218: the leader was restarted with the cut, an older process still

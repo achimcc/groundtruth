@@ -13,6 +13,8 @@ pub trait Runner {
     fn read(&self, path: &str) -> Result<String>;
     /// The names of the directories directly below `path` (no `.`/`..`).
     fn subdirs(&self, path: &str) -> Result<Vec<String>>;
+    /// The target of a symbolic link, e.g. `/proc/<pid>/ns/user`.
+    fn readlink(&self, path: &str) -> Result<String>;
 }
 
 pub struct RealRunner {
@@ -80,6 +82,13 @@ impl Runner for RealRunner {
         out.sort();
         Ok(out)
     }
+
+    fn readlink(&self, path: &str) -> Result<String> {
+        Ok(std::fs::read_link(path)
+            .with_context(|| format!("cannot read link {path}"))?
+            .to_string_lossy()
+            .into_owned())
+    }
 }
 
 /// Answers from a table, for tests. A command or file that is not in the
@@ -88,6 +97,7 @@ impl Runner for RealRunner {
 pub struct FakeRunner {
     pub commands: Vec<(String, String)>,
     pub files: Vec<(String, String)>,
+    pub links: Vec<(String, String)>,
 }
 
 impl FakeRunner {
@@ -98,6 +108,11 @@ impl FakeRunner {
 
     pub fn file(mut self, path: &str, content: &str) -> Self {
         self.files.push((path.to_string(), content.to_string()));
+        self
+    }
+
+    pub fn link(mut self, path: &str, target: &str) -> Self {
+        self.links.push((path.to_string(), target.to_string()));
         self
     }
 }
@@ -133,5 +148,13 @@ impl Runner for FakeRunner {
         out.sort();
         out.dedup();
         Ok(out)
+    }
+
+    fn readlink(&self, path: &str) -> Result<String> {
+        self.links
+            .iter()
+            .find(|(k, _)| k == path)
+            .map(|(_, v)| v.clone())
+            .with_context(|| format!("cannot read link {path}"))
     }
 }
